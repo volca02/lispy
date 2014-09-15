@@ -59,9 +59,7 @@ struct environment;
 
 /// list
 struct list {
-    list() {};
-
-    list(const atom &a);
+    list() : car(), cdr() {};
 
     list(const list &src);
 
@@ -97,6 +95,8 @@ struct list {
     const atom &operator[](size_t idx) const;
 
     atom &operator[](size_t idx);
+
+    list &operator=(list &&other);
 
     const atom &front() const;
     atom &front();
@@ -144,8 +144,6 @@ struct list {
             return node == other.node;
         }
 
-
-
         bool end() {
             return node == NULL;
         }
@@ -165,6 +163,7 @@ struct list {
 
     void push_back(const atom &a);
     void push_back(atom &&a);
+    void append(atom &&a);
 
     std::unique_ptr<atom> car;
     std::unique_ptr<list> cdr;
@@ -203,11 +202,16 @@ public:
         case LST: return "LST";
         case PRC: return "PRC";
         }
+        return "<INVALID>";
     }
 
     atom_type t;
     typedef std::string string;
     typedef std::function<atom (environment &env, const atom &)> proc;
+
+    atom_type type() const {
+        return t;
+    }
 
     union {
         int iv;
@@ -241,21 +245,22 @@ public:
     atom(atom &&src) : t(src.t) {
         switch (t) {
         case NIL:
-            return;
+            break;
         case INT:
             new (&iv) int(std::move(src.iv));
-            return;
+            break;
         case STR:
             new (&sv) string(std::move(src.sv));
-            return;
+            break;
         case LST:
             new (&lv) list(std::move(src.lv));
-            return;
+            break;
         case PRC:
             new (&fv) proc(std::move(src.fv));
-            return;
+            break;
         }
-        src.clear();
+        // don't call clear here!
+        src.t = NIL;
     }
 
     atom(const atom &src) : t(src.t) {
@@ -309,7 +314,7 @@ public:
 
     atom(list &&l) {
         t = LST;
-        new (&lv) list(l);
+        new (&lv) list(std::move(l));
     }
 
     ~atom() {
@@ -320,6 +325,32 @@ public:
         clear();
         t = PRC;
         new (&fv) proc(p);
+        return *this;
+    }
+
+    atom &operator=(atom &&a) {
+        clear();
+
+        t = a.t;
+        switch (a.t) {
+        case NIL:
+            break;
+        case INT:
+            iv = a.iv;
+            break;
+        case STR:
+            new (&sv) std::string(std::move(a.sv));
+            break;
+        case LST:
+            new (&lv) list(std::move(a.lv));
+            break;
+        case PRC:
+            new (&fv) proc(std::move(a.fv));
+            break;
+        }
+
+        a.t = NIL;
+        return *this;
     }
 
     static const atom True;
@@ -329,18 +360,18 @@ public:
     void clear() {
         switch (t) {
         case NIL:
-            return;
+            break;
         case INT:
-            return;
+            break;
         case STR:
             sv.~string();
-            return;
+            break;
         case LST:
             lv.~list();
-            return;
+            break;
         case PRC:
             fv.~proc();
-            return;
+            break;
         }
         t = NIL;
     }
@@ -365,6 +396,7 @@ public:
             new (&fv) proc(src.fv);
             return *this;
         }
+        return *this;
     }
 
     //// Will not construct a list!
@@ -402,7 +434,7 @@ public:
         return lv;
     }
 
-    const atom &operator[](int idx) const {
+    const atom &operator[](size_t idx) const {
         expect(LST);
         if (idx >= size())
             return Nil;
@@ -459,6 +491,7 @@ public:
         case PRC:
             return "PROC";
         }
+        return "<INVALID>";
     }
 
     atom eval(environment &env) const;
@@ -472,12 +505,23 @@ public:
         return atom(lv.rest(), env);
     }
 
+    atom evalEach(environment &env) const {
+        return atom(lv, env);
+    }
+
     atom front() const {
+        expect(LST);
         return atom(lv.front());
     }
 
     atom rest() const {
+        expect(LST);
         return atom(lv.rest());
+    }
+
+    atom length() const {
+        expect(LST);
+        return atom(lv.size());
     }
 
     bool operator==(const atom &b) {
@@ -497,16 +541,13 @@ public:
             // TODO!
             return false;
         }
+        return false;
     }
 };
 
 const atom atom::True("#t");
-const atom atom::False("#f");
+const atom atom::False;
 const atom atom::Nil;
-
-list::list(const atom &a) {
-    push_back(a);
-}
 
 list::list(const list &src) : car(src.car ? new atom(*src.car) : nullptr),
                               cdr(src.cdr ? new list(*src.cdr) : nullptr)
@@ -514,8 +555,15 @@ list::list(const list &src) : car(src.car ? new atom(*src.car) : nullptr),
 
 list::list(const list &src, environment &env)
     : car(src.car ? new atom(src.car->eval(env)) : nullptr),
-      cdr(src.cdr ? new list(*src.cdr) : nullptr)
+      cdr(src.cdr ? new list(*src.cdr, env) : nullptr)
 {}
+
+list &list::operator=(list &&a) {
+    std::swap(car, a.car);
+    std::swap(cdr, a.cdr);
+    a.clear();
+    return *this;
+}
 
 const atom &list::front() const {
     if (car)
@@ -563,8 +611,10 @@ void list::push_back(const atom &a) {
     if (car) {
         if (cdr)
             cdr->push_back(a);
-        else
-            cdr.reset(new list(a));
+        else {
+            cdr.reset(new list());
+            cdr->push_back(a);
+        }
     } else {
         if (cdr)
             throw std::runtime_error("CAR not null, CDR set!");
@@ -573,12 +623,39 @@ void list::push_back(const atom &a) {
     }
 }
 
+void list::append(atom &&a) {
+    // TODO: append internal, so we won't check this every step
+    if (a.type() != atom::LST) {
+        push_back(a);
+        return;
+    }
+
+    if (car) {
+        if (cdr)
+            cdr->append(std::move(a));
+        else {
+            cdr.reset(new list());
+            *cdr = std::move(a.asList());
+            a.clear();
+        }
+    } else {
+        if (cdr)
+            throw std::runtime_error("CAR not null, CDR set!");
+
+        list mv = std::move(a.asList());
+        car = std::move(mv.car);
+        cdr = std::move(mv.cdr);
+        a.clear();
+    }
+}
+
 void list::push_back(atom &&a) {
     if (car) {
         if (cdr) {
             cdr->push_back(a);
         } else {
-            cdr.reset(new list(std::move(a)));
+            cdr.reset(new list());
+            cdr->push_back(std::move(a));
             a.clear();
         }
     } else {
@@ -639,7 +716,7 @@ struct environment {
     typedef std::map<std::string, atom> map;
 
     environment(std::shared_ptr<environment> parent)
-        : outer(outer)
+        : outer(parent)
     {}
 
     environment()
@@ -658,8 +735,7 @@ struct environment {
         if (outer)
             return (*outer)[key];
 
-        // create a new atom entry
-        return values[key];
+        throw std::invalid_argument("No symbol with name " + key);
     }
 
     const atom &operator[](const std::string &key) const {
@@ -670,7 +746,22 @@ struct environment {
         if (outer)
             return (*outer)[key];
 
-        return atom::Nil;
+        throw std::invalid_argument("No symbol with name " + key);
+    }
+
+    atom &set(const std::string &key) {
+        map::iterator i = values.find(key);
+        if (i != values.end())
+            return i->second;
+
+        if (outer) {
+            i = outer->values.find(key);
+            if (i != outer->values.end())
+                return i->second;
+        }
+
+        // create new entry
+        return values[key];
     }
 
     map values;
@@ -685,36 +776,47 @@ atom atom::eval(environment &env) const {
         return *this;
     case STR:
         return env[sv];
-    case LST:
+    case LST: {
         if (lv.empty())
             return Nil;
+        atom result = env[lv.begin()->asString()](env, rest());
+#ifdef LISPY_DEBUG
         // evaluate by finding proc for first element
-        return env[lv.begin()->asString()](env, rest());
+        std::cout << "Eval  "   << repr()
+                  << " with "   << lv.begin()->asString()
+                  << " args "   << rest().repr()
+                  << " via "    << env[lv.begin()->asString()].repr()
+                  << " yields " << result.repr()
+                  << std::endl;
+#endif
+        return result;
+    }
     case PRC:
         return fv(env, evalRest(env));
     }
+    return Nil;
 }
 
 void bind_std(environment &env) {
-    env["nil"] = atom::Nil;
-    env["#t"] = atom::True;
-    env["#f"] = atom::False;
-    env["if"] = [](environment &env, const atom &params) {
+    env.set("nil") = atom::Nil;
+    env.set("#t") = atom::True;
+    env.set("#f") = atom::False;
+    env.set("if") = [](environment &env, const atom &params) {
         return params[0].eval(env) == atom::False ?
         (params[2].eval(env)) :
         (params[1].eval(env));
     };
 
     // TODO: These should respect the environment of the atom in question
-    env["set!"] = [](environment &env, const atom &params) {
-        return env[params[0].asString()] = params[1].eval(env);
+    env.set("set!") = [](environment &env, const atom &params) {
+        return env.set(params[0].asString()) = params[1].eval(env);
     };
 
-    env["define"] = [](environment &env, const atom &params) {
-        return env[params[0].asString()] = params[1].eval(env);
+    env.set("define") = [](environment &env, const atom &params) {
+        return env.set(params[0].asString()) = params[1].eval(env);
     };
 
-    env["env"] = [](environment &env, const atom &) {
+    env.set("env") = [](environment &env, const atom &) {
         atom aenv(atom::LST);
         for (const auto &kv : env.values) {
             atom val(atom::LST);
@@ -725,23 +827,38 @@ void bind_std(environment &env) {
         return aenv;
     };
 
-    env["quote"] = [](environment &env, const atom &v) {
+    env.set("quote") = [](environment &env, const atom &v) {
         return v[0];
     };
 
-    env["eval"] = [](environment &env, const atom &v) {
-        return env.eval(v[0]);
+    env.set("list") = [](environment &env, const atom &v) {
+        return v.evalEach(env);
     };
 
-    env["car"] = [](environment &env, const atom &v) {
+    env.set("length") = [](environment &env, const atom &v) {
+        return v[0].eval(env).length();
+    };
+
+    env.set("eval") = [](environment &env, const atom &v) {
+        return v[0].eval(env).eval(env);
+    };
+
+    env.set("append") = [](environment &env, const atom &v) {
+        atom ev = v[0].eval(env);
+        atom lst = ev[0];
+        lst.asList().append(lst.rest());
+        return lst;
+    };
+
+    env.set("car") = [](environment &env, const atom &v) {
         return v[0].eval(env).front();
     };
 
-    env["cdr"] = [](environment &env, const atom &v) {
+    env.set("cdr") = [](environment &env, const atom &v) {
         return v[0].eval(env).rest();
     };
 
-    env["*"] = [](environment &env, const atom &v) {
+    env.set("*") = [](environment &env, const atom &v) {
         int res = 1;
         for (const atom &a : v.asList()) {
             res *= a.eval(env).asInt();
@@ -749,7 +866,7 @@ void bind_std(environment &env) {
         return atom(res);
     };
 
-    env["+"] = [](environment &env, const atom &v) {
+    env.set("+") = [](environment &env, const atom &v) {
         int res = 0;
         for (const atom &a : v.asList()) {
             res += a.eval(env).asInt();
@@ -757,7 +874,7 @@ void bind_std(environment &env) {
         return atom(res);
     };
 
-    env["-"] = [](environment &env, const atom &v) {
+    env.set("-") = [](environment &env, const atom &v) {
         const list &lst = v.asList();
         int res = lst.front().eval(env).asInt();
         for (const atom &a : lst.rest()) {
@@ -766,7 +883,7 @@ void bind_std(environment &env) {
         return atom(res);
     };
 
-    env["/"] = [](environment &env, const atom &v) {
+    env.set("/") = [](environment &env, const atom &v) {
         const list &lst = v.asList();
         int res = lst.front().eval(env).asInt();
         for (const atom &a : lst.rest()) {
@@ -775,7 +892,7 @@ void bind_std(environment &env) {
         return atom(res);
     };
 
-    env["<"] = [](environment &env, const atom &v) {
+    env.set("<") = [](environment &env, const atom &v) {
         const list &lst = v.asList();
         int res = lst.front().eval(env).asInt();
         for (const atom &a : lst.rest()) {
@@ -785,7 +902,7 @@ void bind_std(environment &env) {
         return atom::True;
     };
 
-    env[">"] = [](environment &env, const atom &v) {
+    env.set(">") = [](environment &env, const atom &v) {
         const list &lst = v.asList();
         int res = lst.front().eval(env).asInt();
         for (const atom &a : lst.rest()) {
@@ -826,16 +943,19 @@ atom build_from(tokenizer &t) {
     }
 }
 
-void exec(environment &env, const std::string &expr) {
+atom exec(environment &env, const std::string &expr) {
     str_view sv(expr);
 
     tokenizer t(sv);
 
+    atom result;
+
     while (t.has_next()) {
         atom parsed = build_from(t);
-        // evaluate via environment
-        std::cout << env.eval(parsed).repr() << std::endl;
+        result = env.eval(parsed);
     }
+
+    return result;
 }
 
 } // namespace lispy
