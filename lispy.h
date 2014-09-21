@@ -823,15 +823,6 @@ atom atom::eval(environment &env) const {
         return env[sv];
     case LMB:
     {
-        // how do we eval a lambda? Caller has to know!
-        // we expect to have a good temporary environment with all the bindables
-        // set. This is up to the caller.
-        // Lambda has to be identified and the env prepared at the right place
-        // by listing all the args of the lambda, filling them with values from
-        // the expression, then calling eval here with the temporary env.
-        // we just evaluate the list as we would normally
-        // lv[0] == arg list
-        // lv[1] == lambda body
         return lambda_body().eval(env);
     }
     case LST: {
