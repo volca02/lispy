@@ -56,6 +56,8 @@ public:
 
 struct atom;
 struct environment;
+std::shared_ptr<environment> clone_environment(
+        const std::shared_ptr<environment> &env);
 
 /// list
 struct list {
@@ -189,9 +191,10 @@ public:
     enum atom_type {
         NIL = 0,
         INT = 1,
-        STR = 3,
-        LST = 4,
-        PRC = 5
+        STR = 2,
+        LST = 3,
+        PRC = 4,
+        LMB = 5
     };
 
     static const char* strtype(atom_type t) {
@@ -201,24 +204,17 @@ public:
         case STR: return "STR";
         case LST: return "LST";
         case PRC: return "PRC";
+        case LMB: return "LMB";
         }
         return "<INVALID>";
     }
 
-    atom_type t;
     typedef std::string string;
     typedef std::function<atom (environment &env, const atom &)> proc;
 
     atom_type type() const {
         return t;
     }
-
-    union {
-        int iv;
-        string sv;
-        list lv;
-        proc fv;
-    };
 
     atom() : t(NIL) {
     }
@@ -233,6 +229,7 @@ public:
         case STR:
             new (&sv) string();
             return;
+        case LMB:
         case LST:
             new (&lv) list();
             return;
@@ -252,6 +249,8 @@ public:
         case STR:
             new (&sv) string(std::move(src.sv));
             break;
+        case LMB:
+            env = std::move(src.env);
         case LST:
             new (&lv) list(std::move(src.lv));
             break;
@@ -273,11 +272,14 @@ public:
         case STR:
             new (&sv) string(src.sv);
             return;
+        case LMB:
+            env = clone_environment(src.env);
         case LST:
             new (&lv) list(src.lv);
             return;
         case PRC:
             new (&fv) proc(src.fv);
+            return;
             return;
         }
     }
@@ -341,11 +343,14 @@ public:
         case STR:
             new (&sv) std::string(std::move(a.sv));
             break;
+        case LMB:
+            env = std::move(a.env);
         case LST:
             new (&lv) list(std::move(a.lv));
             break;
         case PRC:
             new (&fv) proc(std::move(a.fv));
+            break;
             break;
         }
 
@@ -366,6 +371,8 @@ public:
         case STR:
             sv.~string();
             break;
+        case LMB:
+            env.reset();
         case LST:
             lv.~list();
             break;
@@ -389,6 +396,8 @@ public:
         case STR:
             new (&sv) string(src.sv);
             return *this;
+        case LMB:
+            env = clone_environment(src.env);
         case LST:
             new (&lv) list(src.lv);
             return *this;
@@ -470,6 +479,7 @@ public:
     }
 
     std::string repr(const std::string &indent = "") const {
+        std::string result;
         switch (t) {
         case NIL:
             return "nil";
@@ -477,8 +487,10 @@ public:
             return std::to_string(iv);
         case STR:
             return '"' + sv + '"';
+        case LMB:
+            result = "<Lambda>";
         case LST: {
-            std::string result = "(";
+            result = "(";
             bool frst = true;
             for (const atom& a : lv) {
                 if (!frst) result += ' ';
@@ -496,10 +508,7 @@ public:
 
     atom eval(environment &env) const;
 
-    atom operator()(environment &env, const atom &values) {
-        expect(PRC);
-        return fv(env, values);
-    }
+    atom operator()(environment &env, const atom &values);
 
     atom evalRest(environment &env) const {
         return atom(lv.rest(), env);
@@ -534,6 +543,7 @@ public:
             return iv == b.iv;
         case STR:
             return sv == b.sv;
+        case LMB:
         case LST:
             // TODO!
             return false;
@@ -543,6 +553,28 @@ public:
         }
         return false;
     }
+
+    const atom &lambda_args() const {
+        expect(LMB);
+        return lv[0];
+    }
+
+    const atom &lambda_body() const {
+        expect(LMB);
+        return lv[1];
+    }
+
+    atom toLambda(const environment &env) const;
+
+private:
+    atom_type t;
+    std::shared_ptr<environment> env;
+    union {
+        int iv;
+        string sv;
+        list lv;
+        proc fv;
+    };
 };
 
 const atom atom::True("#t");
@@ -768,6 +800,15 @@ struct environment {
     std::shared_ptr<environment> outer;
 };
 
+std::shared_ptr<environment> clone_environment(
+        const std::shared_ptr<environment> &env)
+{
+    if (env)
+        return std::make_shared<environment>(*env);
+    else
+        return std::shared_ptr<environment>();
+}
+
 atom atom::eval(environment &env) const {
     switch (t) {
     case NIL:
@@ -776,6 +817,19 @@ atom atom::eval(environment &env) const {
         return *this;
     case STR:
         return env[sv];
+    case LMB:
+    {
+        // how do we eval a lambda? Caller has to know!
+        // we expect to have a good temporary environment with all the bindables
+        // set. This is up to the caller.
+        // Lambda has to be identified and the env prepared at the right place
+        // by listing all the args of the lambda, filling them with values from
+        // the expression, then calling eval here with the temporary env.
+        // we just evaluate the list as we would normally
+        // lv[0] == arg list
+        // lv[1] == lambda body
+        return lambda_body().eval(env);
+    }
     case LST: {
         if (lv.empty())
             return Nil;
@@ -797,6 +851,56 @@ atom atom::eval(environment &env) const {
     return Nil;
 }
 
+atom atom::operator()(environment &current_env, const atom &values) {
+    if (t == PRC)
+        return fv(current_env, values);
+    else if (t == LMB) {
+        if (!env)
+            throw std::invalid_argument(
+                    "Lambda is missing environment");
+
+        environment temp(*env);
+
+        // iterate lambda_args, fill all with values
+        list::const_iterator vit = values.asList().begin();
+        for (const auto &larg : lambda_args().asList()) {
+            if (vit == values.asList().end()) {
+                throw std::invalid_argument(
+                        "Lambda call with incomplete arguments");
+            }
+
+            temp.set(larg.asString()) = *vit++;
+        }
+
+        return eval(temp);
+    }
+
+    throw std::invalid_argument(
+            "Could not eval");
+}
+
+atom atom::toLambda(const environment &env) const {
+    expect(LST);
+    if (lv.size() != 2)
+        throw std::invalid_argument(
+                "Lambda definition needs two list params");
+
+    if (lv[0].t != LST)
+        throw std::invalid_argument(
+                "Lambda definition's first arg has to be list of args");
+
+    if (lv[1].t != LST)
+        throw std::invalid_argument(
+                "Lambda definition's second arg has to be the body");
+
+    // special conversion here
+    atom cpy(*this);
+    cpy.t = LMB;
+    cpy.env.reset(new environment(env));
+    return cpy;
+}
+
+
 void bind_std(environment &env) {
     env.set("nil") = atom::Nil;
     env.set("#t") = atom::True;
@@ -810,6 +914,14 @@ void bind_std(environment &env) {
     // TODO: These should respect the environment of the atom in question
     env.set("set!") = [](environment &env, const atom &params) {
         return env.set(params[0].asString()) = params[1].eval(env);
+    };
+
+    env.set("setq") = [](environment &env, const atom &params) {
+        return env.set(params[0].asString()) = params[1];
+    };
+
+    env.set("lambda") = [](environment &env, const atom &params) {
+        return params.toLambda(env);
     };
 
     env.set("define") = [](environment &env, const atom &params) {
