@@ -113,7 +113,11 @@ struct list {
     list eval_rest();
 
     struct const_iterator {
-        const_iterator(const list * l = nullptr) : node(l) {}
+        const_iterator(const list * l = nullptr) : node(l) {
+            // step to next if the current has nil car empty, in fact
+            if (node && !node->car)
+                node = nullptr;
+        }
 
         const atom &operator*() {
             assert(node);
@@ -147,7 +151,7 @@ struct list {
         }
 
         bool end() {
-            return node == NULL;
+            return !node;
         }
 
         const list *node;
@@ -490,7 +494,7 @@ public:
         case LMB:
             result = "<Lambda>";
         case LST: {
-            result = "(";
+            result += "(";
             bool frst = true;
             for (const atom& a : lv) {
                 if (!frst) result += ' ';
@@ -831,8 +835,10 @@ atom atom::eval(environment &env) const {
         return lambda_body().eval(env);
     }
     case LST: {
+        // empty list evaluates to itself
         if (lv.empty())
-            return Nil;
+            return *this;
+
         atom result = env[lv.begin()->asString()](env, rest());
 #ifdef LISPY_DEBUG
         // evaluate by finding proc for first element
@@ -859,8 +865,6 @@ atom atom::operator()(environment &current_env, const atom &values) {
             throw std::invalid_argument(
                     "Lambda is missing environment");
 
-        environment temp(*env);
-
         // iterate lambda_args, fill all with values
         list::const_iterator vit = values.asList().begin();
         for (const auto &larg : lambda_args().asList()) {
@@ -869,10 +873,10 @@ atom atom::operator()(environment &current_env, const atom &values) {
                         "Lambda call with incomplete arguments");
             }
 
-            temp.set(larg.asString()) = *vit++;
+            env->set(larg.asString()) = *vit++;
         }
 
-        return eval(temp);
+        return lambda_body().eval(*env);
     }
 
     throw std::invalid_argument(
